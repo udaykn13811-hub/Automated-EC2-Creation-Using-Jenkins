@@ -22,21 +22,15 @@ pipeline {
         )
 
         string(
-            name: 'AMI_ID',
-            defaultValue: 'ami-xxxxxxxxxxxxxxxxx',
-            description: 'Amazon Linux 2023 AMI ID'
-        )
-
-        string(
             name: 'SUBNET_ID',
-            defaultValue: 'subnet-xxxxxxxx',
-            description: 'Target subnet ID'
+            defaultValue: 'subnet-REPLACE_WITH_ACTUAL_ID',
+            description: 'Actual subnet ID in ap-south-2'
         )
 
         string(
             name: 'SECURITY_GROUP_ID',
-            defaultValue: 'sg-xxxxxxxx',
-            description: 'Security group ID'
+            defaultValue: 'sg-REPLACE_WITH_ACTUAL_ID',
+            description: 'Actual security group ID'
         )
 
         string(
@@ -60,7 +54,7 @@ pipeline {
 
         stage('Checkout') {
             steps {
-                echo 'Starting EC2 provisioning project'
+                echo 'Starting Automated EC2 Provisioning Project'
                 checkout scm
             }
         }
@@ -74,23 +68,30 @@ pipeline {
                         error('Invalid EC2 instance name')
                     }
 
+                    if (!params.SUBNET_ID.matches('subnet-[a-fA-F0-9]+')) {
+                        error('Enter a valid subnet ID')
+                    }
+
+                    if (!params.SECURITY_GROUP_ID.matches('sg-[a-fA-F0-9]+')) {
+                        error('Enter a valid security group ID')
+                    }
+
+                    if (!params.KEY_NAME?.trim()) {
+                        error('EC2 key pair name is required')
+                    }
+
                     if (!(params.VOLUME_SIZE ==~ /[0-9]+/)) {
                         error('Volume size must be numeric')
                     }
 
-                    if (params.VOLUME_SIZE.toInteger() < 8 ||
-                        params.VOLUME_SIZE.toInteger() > 100) {
+                    int volumeSize = params.VOLUME_SIZE.toInteger()
+
+                    if (volumeSize < 8 || volumeSize > 100) {
                         error('Volume size must be between 8 and 100 GB')
                     }
 
-                    if (!params.AMI_ID.startsWith('ami-') ||
-                        !params.SUBNET_ID.startsWith('subnet-') ||
-                        !params.SECURITY_GROUP_ID.startsWith('sg-')) {
-                        error('Invalid AWS resource ID')
-                    }
-
                     if (params.ENVIRONMENT == 'Production') {
-                        error('Production provisioning requires a separate approval workflow')
+                        error('Production provisioning is disabled until an approval workflow is configured')
                     }
                 }
             }
@@ -112,30 +113,96 @@ pipeline {
             }
         }
 
+        stage('Get Latest Amazon Linux AMI') {
+            steps {
+                script {
+                    env.AMI_ID = sh(
+                        script: '''
+                            set -e
+
+                            aws ssm get-parameter \
+                              --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+                              --region "$AWS_REGION" \
+                              --query 'Parameter.Value' \
+                              --output text
+                        ''',
+                        returnStdout: true
+                    ).trim()
+
+                    if (!env.AMI_ID.matches('ami-[a-fA-F0-9]+')) {
+                        error("Invalid AMI returned by SSM: ${env.AMI_ID}")
+                    }
+
+                    echo "Retrieved Amazon Linux 2023 AMI: ${env.AMI_ID}"
+                }
+            }
+        }
+
         stage('Validate AWS Resources') {
             steps {
                 sh '''
                     set -e
 
+                    echo "===================================="
                     echo "Validating AMI..."
+                    echo "===================================="
 
                     aws ec2 describe-images \
                       --image-ids "$AMI_ID" \
                       --region "$AWS_REGION" \
-                      --query 'Images[0].ImageId' \
+                      --query 'Images[0].State' \
                       --output text
 
+                    echo "===================================="
                     echo "Validating subnet..."
+                    echo "===================================="
 
-                    aws ec2 describe-subnets \
+                    SUBNET_VPC=$(aws ec2 describe-subnets \
                       --subnet-ids "$SUBNET_ID" \
-                      --region "$AWS_REGION"
+                      --region "$AWS_REGION" \
+                      --query 'Subnets[0].VpcId' \
+                      --output text)
 
+                    if [ "$SUBNET_VPC" = "None" ] || [ -z "$SUBNET_VPC" ]; then
+                        echo "Subnet validation failed"
+                        exit 1
+                    fi
+
+                    echo "Subnet VPC: $SUBNET_VPC"
+
+                    echo "===================================="
                     echo "Validating security group..."
+                    echo "===================================="
 
-                    aws ec2 describe-security-groups \
+                    SG_VPC=$(aws ec2 describe-security-groups \
                       --group-ids "$SECURITY_GROUP_ID" \
+                      --region "$AWS_REGION" \
+                      --query 'SecurityGroups[0].VpcId' \
+                      --output text)
+
+                    if [ "$SG_VPC" = "None" ] || [ -z "$SG_VPC" ]; then
+                        echo "Security group validation failed"
+                        exit 1
+                    fi
+
+                    echo "Security Group VPC: $SG_VPC"
+
+                    if [ "$SUBNET_VPC" != "$SG_VPC" ]; then
+                        echo "ERROR: Subnet and security group belong to different VPCs"
+                        exit 1
+                    fi
+
+                    echo "Subnet and security group VPC validation successful"
+
+                    echo "===================================="
+                    echo "Validating EC2 key pair..."
+                    echo "===================================="
+
+                    aws ec2 describe-key-pairs \
+                      --key-names "$KEY_NAME" \
                       --region "$AWS_REGION"
+
+                    echo "All AWS resources validated successfully"
                 '''
             }
         }
@@ -143,10 +210,13 @@ pipeline {
         stage('Create EC2 Instance') {
             steps {
                 script {
-
                     env.INSTANCE_ID = sh(
                         script: '''
                             set -e
+
+                            echo "===================================="
+                            echo "Creating EC2 Instance..."
+                            echo "===================================="
 
                             aws ec2 run-instances \
                               --image-id "$AMI_ID" \
@@ -156,6 +226,7 @@ pipeline {
                               --security-group-ids "$SECURITY_GROUP_ID" \
                               --block-device-mappings \
                               "[{\\"DeviceName\\":\\"/dev/xvda\\",\\"Ebs\\":{\\"VolumeSize\\":$VOLUME_SIZE,\\"VolumeType\\":\\"gp3\\",\\"DeleteOnTermination\\":true}}]" \
+                              --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
                               --tag-specifications \
                               "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_NAME},{Key=Environment,Value=$ENVIRONMENT},{Key=ManagedBy,Value=Jenkins}]" \
                               --count 1 \
@@ -165,6 +236,10 @@ pipeline {
                         ''',
                         returnStdout: true
                     ).trim()
+
+                    if (!env.INSTANCE_ID.matches('i-[a-fA-F0-9]+')) {
+                        error("EC2 creation returned an invalid instance ID: ${env.INSTANCE_ID}")
+                    }
 
                     echo "EC2 Instance Created: ${env.INSTANCE_ID}"
                 }
@@ -182,7 +257,7 @@ pipeline {
                       --instance-ids "$INSTANCE_ID" \
                       --region "$AWS_REGION"
 
-                    echo "EC2 instance is running"
+                    echo "EC2 instance is running successfully"
                 '''
             }
         }
@@ -190,7 +265,11 @@ pipeline {
         stage('Get EC2 Details') {
             steps {
                 sh '''
-                    echo "Fetching EC2 instance details..."
+                    set -e
+
+                    echo "===================================="
+                    echo "Fetching EC2 Instance Details"
+                    echo "===================================="
 
                     aws ec2 describe-instances \
                       --instance-ids "$INSTANCE_ID" \
@@ -200,7 +279,9 @@ pipeline {
                         InstanceType:InstanceType,
                         State:State.Name,
                         PrivateIP:PrivateIpAddress,
-                        PublicIP:PublicIpAddress
+                        PublicIP:PublicIpAddress,
+                        AvailabilityZone:Placement.AvailabilityZone,
+                        AMI:ImageId
                       }' \
                       --output table
                 '''
@@ -211,13 +292,14 @@ pipeline {
     post {
         success {
             echo """
-            ====================================
-                 EC2 CREATION SUCCESSFUL
-            ====================================
+            ========================================
+                EC2 CREATION SUCCESSFUL
+            ========================================
             Instance ID: ${env.INSTANCE_ID}
             Environment: ${params.ENVIRONMENT}
             Instance Type: ${params.INSTANCE_TYPE}
-            ====================================
+            Region: ${env.AWS_REGION}
+            ========================================
             """
         }
 
@@ -226,7 +308,7 @@ pipeline {
         }
 
         always {
-            echo 'EC2 provisioning pipeline execution completed.'
+            echo 'EC2 provisioning pipeline execution finished.'
         }
     }
 }
